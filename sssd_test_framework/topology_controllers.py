@@ -42,7 +42,26 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().init(*args, **kwargs)
         self.provisioned = self.name in self.multihost.provisioned_topologies
 
+    def _refresh_connections(self) -> None:
+        """
+        Disconnect and reconnect SSH sessions for all hosts in the topology.
+
+        After many tests, SSH sessions can become stale (channel exhaustion)
+        from hundreds of rapid channel open/close cycles on the same session.
+        Refreshing connections before topology switches prevents
+        LibsshChannelException errors during the heavy setup/teardown operations.
+        """
+        for host in self.hosts:
+            try:
+                self.logger.info(f"Refreshing SSH connection to {host.hostname}")
+                host.conn.disconnect()
+                host.conn.connect()
+            except Exception as e:
+                self.logger.warning(f"Failed to refresh SSH connection to {host.hostname}: {e}")
+
     def topology_setup(self, *args, **kwargs) -> None:
+        self._refresh_connections()
+
         if self.provisioned:
             self.logger.info(f"Topology '{self.name}' is already provisioned")
             return
@@ -50,6 +69,8 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().topology_setup(*args, **kwargs)
 
     def topology_teardown(self, *args, **kwargs) -> None:
+        self._refresh_connections()
+
         if self.provisioned:
             return
 
