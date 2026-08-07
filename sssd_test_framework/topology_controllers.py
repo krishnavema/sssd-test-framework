@@ -64,12 +64,21 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
             return
 
         ProvisionedBackupTopologyController._last_refresh_time = now
+
+        all_hosts = []
+        for domain in self.multihost.domains:
+            all_hosts.extend(domain.hosts)
+
         self.logger.info(
-            f"Refreshing SSH connections after {int(elapsed)}s to prevent channel exhaustion"
+            f"Refreshing SSH connections for {len(all_hosts)} hosts after {int(elapsed)}s "
+            f"to prevent channel exhaustion"
         )
-        for host in self.hosts:
+        for host in all_hosts:
             self.logger.info(f"Refreshing SSH connection to {host.hostname}")
-            host.conn.disconnect()
+            try:
+                host.conn.disconnect()
+            except Exception as e:
+                self.logger.warning(f"Disconnect failed for {host.hostname}: {e}")
             time.sleep(1)
             for attempt in range(3):
                 try:
@@ -105,6 +114,8 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().topology_teardown(*args, **kwargs)
 
     def teardown(self) -> None:
+        self._refresh_connections()
+
         if self.provisioned:
             self.restore_vanilla()
             return
