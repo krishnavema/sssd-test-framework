@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+import time
 
 from pytest_mh import BackupTopologyController
 from pytest_mh.conn import ProcessResult
@@ -33,6 +34,8 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
     Provide basic restore functionality for topologies.
     """
 
+    _last_refresh_time: float | None = None
+
     def __init__(self) -> None:
         super().__init__()
 
@@ -46,18 +49,43 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         """
         Disconnect and reconnect SSH sessions for all hosts in the topology.
 
-        After many tests, SSH sessions can become stale (channel exhaustion)
-        from hundreds of rapid channel open/close cycles on the same session.
-        Refreshing connections before topology switches prevents
-        LibsshChannelException errors during the heavy setup/teardown operations.
+        Skips refresh if connections were established or refreshed less than
+        120 seconds ago — this avoids disrupting fresh connections on the
+        first topology setup while still catching channel exhaustion that
+        builds up over hundreds of test-driven channel open/close cycles.
         """
+        now = time.monotonic()
+        if ProvisionedBackupTopologyController._last_refresh_time is None:
+            ProvisionedBackupTopologyController._last_refresh_time = now
+            return
+
+        elapsed = now - ProvisionedBackupTopologyController._last_refresh_time
+        if elapsed < 120:
+            return
+
+        ProvisionedBackupTopologyController._last_refresh_time = now
+        self.logger.info(
+            f"Refreshing SSH connections after {int(elapsed)}s to prevent channel exhaustion"
+        )
         for host in self.hosts:
-            try:
-                self.logger.info(f"Refreshing SSH connection to {host.hostname}")
-                host.conn.disconnect()
-                host.conn.connect()
-            except Exception as e:
-                self.logger.warning(f"Failed to refresh SSH connection to {host.hostname}: {e}")
+            self.logger.info(f"Refreshing SSH connection to {host.hostname}")
+            host.conn.disconnect()
+            time.sleep(1)
+            for attempt in range(3):
+                try:
+                    host.conn.connect()
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        self.logger.warning(
+                            f"Reconnect attempt {attempt + 1}/3 failed for {host.hostname}: {e}"
+                        )
+                        time.sleep(2)
+                    else:
+                        self.logger.error(
+                            f"Failed to reconnect to {host.hostname} after 3 attempts: {e}"
+                        )
+                        raise
 
     def topology_setup(self, *args, **kwargs) -> None:
         self._refresh_connections()
