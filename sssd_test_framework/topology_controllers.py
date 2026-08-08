@@ -79,7 +79,7 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
                 host.conn.disconnect()
             except Exception as e:
                 self.logger.warning(f"Disconnect failed for {host.hostname}: {e}")
-            time.sleep(1)
+            time.sleep(5)
             for attempt in range(3):
                 try:
                     host.conn.connect()
@@ -89,12 +89,12 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
                         self.logger.warning(
                             f"Reconnect attempt {attempt + 1}/3 failed for {host.hostname}: {e}"
                         )
-                        time.sleep(2)
+                        time.sleep(5)
                     else:
-                        self.logger.error(
-                            f"Failed to reconnect to {host.hostname} after 3 attempts: {e}"
+                        self.logger.warning(
+                            f"Failed to reconnect to {host.hostname} after 3 attempts: {e}, "
+                            f"will rely on lazy reconnection"
                         )
-                        raise
 
     def topology_setup(self, *args, **kwargs) -> None:
         self._refresh_connections()
