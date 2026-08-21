@@ -45,6 +45,27 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().init(*args, **kwargs)
         self.provisioned = self.name in self.multihost.provisioned_topologies
 
+    def _raise_connect_timeout(self, host, seconds: int) -> None:
+        """
+        Raise the underlying libssh connect timeout before a reconnect.
+
+        pytest-mh's ``SSHClient`` reuses a single ``LibsshSession`` and, after
+        the first successful connect, sets its timeout to 1 second (see
+        ``SSHClient.connect``). Because the session object is reused, a later
+        reconnect inherits that 1s timeout, so the handshake to slower hosts
+        (e.g. AWS/ITUP VMs) times out with "ssh connect failed: Timeout
+        connecting". Bump it back up before we reconnect; pytest-mh resets it
+        to 1s itself once the connect succeeds, so normal operation is
+        unaffected.
+        """
+        session = getattr(getattr(host, "conn", None), "_SSHClient__conn", None)
+        if session is None:
+            return
+        try:
+            session.set_ssh_options("timeout", seconds)
+        except Exception as e:
+            self.logger.warning(f"Could not raise connect timeout for {host.hostname}: {e}")
+
     def _refresh_connections(self) -> None:
         """
         Disconnect and reconnect SSH sessions for all hosts in the topology.
@@ -82,6 +103,10 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
             time.sleep(5)
             for attempt in range(3):
                 try:
+                    # Give the handshake a realistic timeout; pytest-mh leaves
+                    # the reused session at a 1s timeout after the first connect,
+                    # which is too tight for slower (AWS/ITUP) hosts.
+                    self._raise_connect_timeout(host, 60)
                     host.conn.connect()
                     break
                 except Exception as e:
@@ -95,6 +120,8 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
                             f"Failed to reconnect to {host.hostname} after 3 attempts: {e}, "
                             f"will rely on lazy reconnection"
                         )
+            if not host.conn.connected:
+                self.logger.warning(f"Host {host.hostname} is not connected after refresh")
 
     def topology_setup(self, *args, **kwargs) -> None:
         self._refresh_connections()
