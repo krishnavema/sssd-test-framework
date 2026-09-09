@@ -45,18 +45,30 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().init(*args, **kwargs)
         self.provisioned = self.name in self.multihost.provisioned_topologies
 
-    def _raise_connect_timeout(self, host, seconds: int) -> None:
+    # Per-host connect timeout used while refreshing (seconds). Long enough for
+    # a slow AWS/ITUP handshake, short enough that a wedged/unreachable host
+    # cannot stall the whole session.
+    _REFRESH_CONNECT_TIMEOUT: int = 15
+
+    # Hard wall-clock budget for a single refresh pass across ALL hosts. Once
+    # exceeded we stop touching further hosts and let pytest-mh reconnect them
+    # lazily. This is what prevents the ~20 min stalls: a refresh can never cost
+    # more than roughly this many seconds no matter how many hosts are slow.
+    _REFRESH_TIME_BUDGET: int = 90
+
+    def _set_connect_timeout(self, host, seconds: int) -> None:
         """
-        Raise the underlying libssh connect timeout before a reconnect.
+        Set the underlying libssh connect timeout on a host's session.
 
         pytest-mh's ``SSHClient`` reuses a single ``LibsshSession`` and, after
-        the first successful connect, sets its timeout to 1 second (see
-        ``SSHClient.connect``). Because the session object is reused, a later
-        reconnect inherits that 1s timeout, so the handshake to slower hosts
-        (e.g. AWS/ITUP VMs) times out with "ssh connect failed: Timeout
-        connecting". Bump it back up before we reconnect; pytest-mh resets it
-        to 1s itself once the connect succeeds, so normal operation is
-        unaffected.
+        the first successful connect, lowers its timeout to 1 second (see
+        ``SSHClient.connect``). Because the session object is reused, any later
+        (re)connect inherits that 1s timeout, so the handshake to slower hosts
+        (e.g. AWS/ITUP VMs) fails with "ssh connect failed: Timeout
+        connecting". We set a sane timeout both before we reconnect here AND so
+        that pytest-mh's own lazy reconnect (used when we give up below) is not
+        left stuck at 1s. pytest-mh drops it back to 1s once a connect succeeds,
+        so steady-state behaviour is unaffected.
         """
         session = getattr(getattr(host, "conn", None), "_SSHClient__conn", None)
         if session is None:
@@ -64,16 +76,26 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         try:
             session.set_ssh_options("timeout", seconds)
         except Exception as e:
-            self.logger.warning(f"Could not raise connect timeout for {host.hostname}: {e}")
+            self.logger.warning(f"Could not set connect timeout for {host.hostname}: {e}")
 
     def _refresh_connections(self) -> None:
         """
-        Disconnect and reconnect SSH sessions for all hosts in the topology.
+        Disconnect and reconnect SSH sessions for all hosts in the topology to
+        clear channels that accumulate over hundreds of test-driven open/close
+        cycles (libssh "Failed to open_session: [-2]" channel exhaustion).
 
-        Skips refresh if connections were established or refreshed less than
-        120 seconds ago — this avoids disrupting fresh connections on the
-        first topology setup while still catching channel exhaustion that
-        builds up over hundreds of test-driven channel open/close cycles.
+        Safety properties (why this cannot repeat the ~24 min stall + cascade
+        that the naive version caused):
+
+        * Throttled: runs at most once every 120s (class-wide).
+        * Time-bounded: the whole pass is capped by ``_REFRESH_TIME_BUDGET`` and
+          each connect by ``_REFRESH_CONNECT_TIMEOUT`` with a SINGLE attempt, so
+          a slow/unreachable host costs seconds, not minutes. (The previous
+          version did 3 attempts x 60s x every host = ~20 min worst case.)
+        * Non-fatal: every failure is swallowed. A host we could not reconnect
+          is left with a sane connect timeout so pytest-mh's lazy reconnect can
+          still recover it on next use, instead of cascading a connect timeout
+          into every subsequent test.
         """
         now = time.monotonic()
         if ProvisionedBackupTopologyController._last_refresh_time is None:
@@ -94,32 +116,40 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
             f"Refreshing SSH connections for {len(all_hosts)} hosts after {int(elapsed)}s "
             f"to prevent channel exhaustion"
         )
+
+        deadline = now + self._REFRESH_TIME_BUDGET
         for host in all_hosts:
+            if time.monotonic() >= deadline:
+                # Out of budget: do not risk stalling the session. Leave the
+                # rest for lazy reconnection with a sane timeout.
+                self.logger.warning(
+                    f"Refresh time budget ({self._REFRESH_TIME_BUDGET}s) exhausted; "
+                    f"skipping remaining hosts, relying on lazy reconnection"
+                )
+                self._set_connect_timeout(host, self._REFRESH_CONNECT_TIMEOUT)
+                continue
+
             self.logger.info(f"Refreshing SSH connection to {host.hostname}")
             try:
                 host.conn.disconnect()
             except Exception as e:
                 self.logger.warning(f"Disconnect failed for {host.hostname}: {e}")
-            time.sleep(5)
-            for attempt in range(3):
-                try:
-                    # Give the handshake a realistic timeout; pytest-mh leaves
-                    # the reused session at a 1s timeout after the first connect,
-                    # which is too tight for slower (AWS/ITUP) hosts.
-                    self._raise_connect_timeout(host, 60)
-                    host.conn.connect()
-                    break
-                except Exception as e:
-                    if attempt < 2:
-                        self.logger.warning(
-                            f"Reconnect attempt {attempt + 1}/3 failed for {host.hostname}: {e}"
-                        )
-                        time.sleep(5)
-                    else:
-                        self.logger.warning(
-                            f"Failed to reconnect to {host.hostname} after 3 attempts: {e}, "
-                            f"will rely on lazy reconnection"
-                        )
+
+            # Single bounded reconnect attempt. If it fails we deliberately do
+            # NOT retry in a loop: retries just multiply the stall, and pytest-mh
+            # will reconnect lazily on next use anyway.
+            self._set_connect_timeout(host, self._REFRESH_CONNECT_TIMEOUT)
+            try:
+                host.conn.connect()
+            except Exception as e:
+                # Ensure the timeout stays sane for the lazy reconnect that
+                # pytest-mh will attempt on the next command.
+                self._set_connect_timeout(host, self._REFRESH_CONNECT_TIMEOUT)
+                self.logger.warning(
+                    f"Reconnect to {host.hostname} failed: {e}; relying on lazy reconnection"
+                )
+                continue
+
             if not host.conn.connected:
                 self.logger.warning(f"Host {host.hostname} is not connected after refresh")
 
