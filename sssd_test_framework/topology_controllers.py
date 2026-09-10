@@ -45,16 +45,25 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().init(*args, **kwargs)
         self.provisioned = self.name in self.multihost.provisioned_topologies
 
-    # Per-host connect timeout used while refreshing (seconds). Long enough for
-    # a slow AWS/ITUP handshake, short enough that a wedged/unreachable host
-    # cannot stall the whole session.
+    # Per-host connect timeout left on the session so pytest-mh's lazy reconnect
+    # (which happens on the next command after we disconnect below) is not stuck
+    # at the 1s timeout pytest-mh lowers it to after the first connect. Long
+    # enough for a slow AWS/ITUP handshake.
     _REFRESH_CONNECT_TIMEOUT: int = 15
 
-    # Hard wall-clock budget for a single refresh pass across ALL hosts. Once
-    # exceeded we stop touching further hosts and let pytest-mh reconnect them
-    # lazily. This is what prevents the ~20 min stalls: a refresh can never cost
-    # more than roughly this many seconds no matter how many hosts are slow.
+    # Hard wall-clock budget for a single refresh pass across ALL hosts. Kept as
+    # a backstop; with disconnect-only refresh a pass is effectively instant.
     _REFRESH_TIME_BUDGET: int = 90
+
+    # Host types we must NEVER proactively disconnect. The AD domain controller
+    # is a Windows host reached over Windows OpenSSH (user "Administrator"): it
+    # does not tolerate having its single persistent session force-closed and
+    # then reconnected, and once wedged it never re-accepts a TCP connection for
+    # the rest of the run. That wedges every subsequent AD test (all of which
+    # need the DC at setup to create users). These hosts also do comparatively
+    # few operations, so they are not where libssh channel exhaustion occurs.
+    # Samba is included for the same Windows-like fragility reasons.
+    _REFRESH_SKIP_TYPES: tuple = (ADHost, SambaHost)
 
     def _set_connect_timeout(self, host, seconds: int) -> None:
         """
@@ -80,22 +89,25 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
 
     def _refresh_connections(self) -> None:
         """
-        Disconnect and reconnect SSH sessions for all hosts in the topology to
-        clear channels that accumulate over hundreds of test-driven open/close
-        cycles (libssh "Failed to open_session: [-2]" channel exhaustion).
+        Disconnect stale SSH sessions so libssh channels that accumulate over
+        hundreds of test-driven open/close cycles are freed ("Failed to
+        open_session: [-2]" channel exhaustion). We do NOT eagerly reconnect:
+        pytest-mh reconnects lazily on the next command against each host, which
+        is both cheaper and far safer.
 
-        Safety properties (why this cannot repeat the ~24 min stall + cascade
-        that the naive version caused):
+        Safety properties (why this cannot repeat the ~24 min stall + cascade,
+        nor the AD-DC-wedge cascade, that earlier versions caused):
 
         * Throttled: runs at most once every 120s (class-wide).
-        * Time-bounded: the whole pass is capped by ``_REFRESH_TIME_BUDGET`` and
-          each connect by ``_REFRESH_CONNECT_TIMEOUT`` with a SINGLE attempt, so
-          a slow/unreachable host costs seconds, not minutes. (The previous
-          version did 3 attempts x 60s x every host = ~20 min worst case.)
-        * Non-fatal: every failure is swallowed. A host we could not reconnect
-          is left with a sane connect timeout so pytest-mh's lazy reconnect can
-          still recover it on next use, instead of cascading a connect timeout
-          into every subsequent test.
+        * Disconnect-only: we never hammer a host with an immediate reconnect.
+          The eager disconnect+reconnect wedged the Windows AD DC (it stopped
+          accepting connections for the rest of the run) and stalled teardown
+          15s x N hosts. Lazy reconnect avoids both.
+        * Skips fragile hosts: the AD/Samba (Windows) hosts are never touched
+          (see ``_REFRESH_SKIP_TYPES``); they are not where channel exhaustion
+          occurs and cannot survive a forced session close.
+        * Non-fatal: every failure is swallowed and a sane connect timeout is
+          left on the session for pytest-mh's lazy reconnect.
         """
         now = time.monotonic()
         if ProvisionedBackupTopologyController._last_refresh_time is None:
@@ -120,38 +132,32 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         deadline = now + self._REFRESH_TIME_BUDGET
         for host in all_hosts:
             if time.monotonic() >= deadline:
-                # Out of budget: do not risk stalling the session. Leave the
-                # rest for lazy reconnection with a sane timeout.
+                # Out of budget (should not happen with disconnect-only, kept as
+                # a backstop). Leave the rest for lazy reconnection.
                 self.logger.warning(
                     f"Refresh time budget ({self._REFRESH_TIME_BUDGET}s) exhausted; "
                     f"skipping remaining hosts, relying on lazy reconnection"
                 )
-                self._set_connect_timeout(host, self._REFRESH_CONNECT_TIMEOUT)
+                break
+
+            # Never proactively disconnect the Windows AD/Samba DC: forcing its
+            # session closed permanently wedges its SSH server and cascades into
+            # every subsequent AD test failing at setup.
+            if isinstance(host, self._REFRESH_SKIP_TYPES):
+                self.logger.info(f"Skipping connection refresh for fragile host {host.hostname}")
                 continue
 
             self.logger.info(f"Refreshing SSH connection to {host.hostname}")
+            # Disconnect only: this frees the leaked libssh channels. We do NOT
+            # eagerly reconnect -- pytest-mh reconnects lazily on the next
+            # command, which avoids both the teardown stall (15s x N hosts) and
+            # the reconnect storm that wedged hosts. Leave a sane connect timeout
+            # so that lazy reconnect is not stuck at pytest-mh's 1s default.
             try:
                 host.conn.disconnect()
             except Exception as e:
                 self.logger.warning(f"Disconnect failed for {host.hostname}: {e}")
-
-            # Single bounded reconnect attempt. If it fails we deliberately do
-            # NOT retry in a loop: retries just multiply the stall, and pytest-mh
-            # will reconnect lazily on next use anyway.
             self._set_connect_timeout(host, self._REFRESH_CONNECT_TIMEOUT)
-            try:
-                host.conn.connect()
-            except Exception as e:
-                # Ensure the timeout stays sane for the lazy reconnect that
-                # pytest-mh will attempt on the next command.
-                self._set_connect_timeout(host, self._REFRESH_CONNECT_TIMEOUT)
-                self.logger.warning(
-                    f"Reconnect to {host.hostname} failed: {e}; relying on lazy reconnection"
-                )
-                continue
-
-            if not host.conn.connected:
-                self.logger.warning(f"Host {host.hostname} is not connected after refresh")
 
     def topology_setup(self, *args, **kwargs) -> None:
         self._refresh_connections()
